@@ -7,6 +7,7 @@ import botas from "../assets/shopping.webp";
 import chaquetaindus from "../assets/chaquetaindus.jfif";
 import casco from "../assets/casco2.webp";
 import guantes from "../assets/guantes2.jpg";
+import ReciboModal from "./ReciboModal";
 
 function MisPedidos({ usuario, setPagina }) {
   const [seccion, setSeccion] = useState("pedidos"); // "pedidos" o "devoluciones"
@@ -40,8 +41,45 @@ function MisPedidos({ usuario, setPagina }) {
   // Estado para la devolución seleccionada a rastrear
   const [devolucionSeleccionada, setDevolucionSeleccionada] = useState(null);
 
-  const URL_PEDIDOS = `http://localhost:3001/mis-pedidos/${usuario?.idUsuarios}`;
-  const URL_DEVOLUCIONES = `http://localhost:3001/mis-devoluciones/${usuario?.idUsuarios}`;
+  // Estado para visualización oficial del Recibo de Compra
+  const [reciboModalData, setReciboModalData] = useState(null);
+
+  // 1. ID de usuario tolerante a ambos nombres de propiedad (idUsuarios o id)
+  const userId = usuario?.idUsuarios || usuario?.id;
+
+  const abrirRecibo = async (p) => {
+    try {
+      const res = await fetch(`http://localhost:3001/recibos/${p.idFacturas}`);
+      if (res.ok) {
+        const data = await res.json();
+        setReciboModalData({
+          recibo: {
+            ...p,
+            ...data.recibo,
+            clienteNombre: data.recibo?.clienteNombre || `${usuario?.Nombres || ''} ${usuario?.Apellidos || ''}`.trim()
+          },
+          detalles: data.detalles || []
+        });
+        return;
+      }
+    } catch (_) {}
+
+    // Fallback con datos locales si el servidor está desconectado
+    const keyDetalle = `pedido_detalle_simulado_${p.idFacturas}`;
+    const detallesLocal = JSON.parse(localStorage.getItem(keyDetalle) || "[]");
+    setReciboModalData({
+      recibo: {
+        ...p,
+        clienteNombre: `${usuario?.Nombres || ''} ${usuario?.Apellidos || ''}`.trim()
+      },
+      detalles: detallesLocal
+    });
+  };
+
+
+  // 2. Definición única de las URLs utilizando el userId dinámico
+  const URL_PEDIDOS = `http://localhost:3001/mis-pedidos/${userId}`;
+  const URL_DEVOLUCIONES = `http://localhost:3001/mis-devoluciones/${userId}`;
 
   const resolverImagen = (p) => {
     const name = (p.Nombre_Producto || "").toLowerCase();
@@ -55,25 +93,34 @@ function MisPedidos({ usuario, setPagina }) {
   };
 
   const cargarPedidos = () => {
-    if (!usuario) return;
+    if (!userId) return;
     setLoadingPedidos(true);
+
+    // Leer pedidos simulados con la clave basada en userId
+    const keyPedidos = `pedidos_simulados_${userId}`;
+    const simulados = JSON.parse(localStorage.getItem(keyPedidos) || "[]");
+
     fetch(URL_PEDIDOS)
       .then((res) => {
         if (!res.ok) throw new Error("Error al obtener pedidos");
         return res.json();
       })
       .then((data) => {
-        setPedidos(data);
+        // Combinar pedidos reales con simulados (sin duplicar por idFacturas)
+        const idsReales = new Set(data.map((p) => p.idFacturas));
+        const simuladosFiltrados = simulados.filter((s) => !idsReales.has(s.idFacturas));
+        setPedidos([...simuladosFiltrados, ...data]);
         setLoadingPedidos(false);
       })
-      .catch((err) => {
-        console.error(err);
+      .catch(() => {
+        // Sin servidor: mostrar solo los simulados
+        setPedidos(simulados);
         setLoadingPedidos(false);
       });
   };
 
   const cargarDevoluciones = () => {
-    if (!usuario) return;
+    if (!userId) return;
     setLoadingDevoluciones(true);
     fetch(URL_DEVOLUCIONES)
       .then((res) => {
@@ -105,7 +152,16 @@ function MisPedidos({ usuario, setPagina }) {
     setPedidoSeleccionado(pedido);
     setLoadingDetalle(true);
     setDetalles([]);
-    
+
+    // Si el pedido es simulado, leerlo del localStorage directamente
+    if (pedido._simulado) {
+      const keyDetalle = `pedido_detalle_simulado_${pedido.idFacturas}`;
+      const detallesGuardados = JSON.parse(localStorage.getItem(keyDetalle) || "[]");
+      setDetalles(detallesGuardados);
+      setLoadingDetalle(false);
+      return;
+    }
+
     fetch(`http://localhost:3001/pedido-detalle/${pedido.idFacturas}`)
       .then((res) => {
         if (!res.ok) throw new Error("Error al obtener artículos");
@@ -117,6 +173,10 @@ function MisPedidos({ usuario, setPagina }) {
       })
       .catch((err) => {
         console.error(err);
+        // Intentar con localStorage como fallback
+        const keyDetalle = `pedido_detalle_simulado_${pedido.idFacturas}`;
+        const detallesGuardados = JSON.parse(localStorage.getItem(keyDetalle) || "[]");
+        setDetalles(detallesGuardados);
         setLoadingDetalle(false);
       });
   };
@@ -383,6 +443,14 @@ function MisPedidos({ usuario, setPagina }) {
                             </td>
                             <td>
                               <div className="d-flex gap-1.5">
+                                <button
+                                  className="btn btn-sm text-white"
+                                  style={{ backgroundColor: "#20B2AA", borderRadius: "8px", fontSize: "11.5px", padding: "6px 10px" }}
+                                  onClick={() => abrirRecibo(p)}
+                                  title="Ver Recibo de Compra"
+                                >
+                                  <i className="bi bi-receipt-cutoff me-1"></i> Recibo
+                                </button>
                                 <button
                                   className="btn btn-sm text-white"
                                   style={{ backgroundColor: "#0047AB", borderRadius: "8px", fontSize: "11.5px", padding: "6px 12px" }}
@@ -1262,6 +1330,15 @@ function MisPedidos({ usuario, setPagina }) {
           </div>
         )}
       </AnimatePresence>
+
+      {/* MODAL OFICIAL RECIBO DE COMPRA */}
+      {reciboModalData && (
+        <ReciboModal
+          recibo={reciboModalData.recibo}
+          detalles={reciboModalData.detalles}
+          onClose={() => setReciboModalData(null)}
+        />
+      )}
 
     </motion.div>
   );

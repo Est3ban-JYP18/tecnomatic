@@ -353,7 +353,7 @@ function Navbar({ setPagina, usuario, cantidadCarrito }) {
                     e.currentTarget.style.background = "transparent";
                   }}
                 >
-                  <i className="bi bi-calculator me-1"></i> Facturación
+                  <i className="bi bi-receipt me-1"></i> Generar Recibos
                 </span>
               </li>
             )}

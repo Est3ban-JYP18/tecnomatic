@@ -121,7 +121,7 @@ function GestionStock() {
   };
 
   const badgeEstado = (estado) => {
-    if (estado === "Activo") return "bg-success";
+    if (estado === "Activo" || estado === "Disponible") return "bg-success";
     if (estado === "Agotado") return "bg-danger";
     return "bg-secondary";
   };
@@ -238,7 +238,12 @@ function GestionStock() {
                             <br /><small className="text-muted">{p.Tipo}</small>
                           </td>
                           <td>{p.Categoria}</td>
-                          <td><span className={`badge ${badgeEstado(p.Estado)}`}>{p.Estado}</span></td>
+                          <td>
+                            <span className={`badge ${badgeEstado(p.Estado)}`}>
+                              {p.Estado === "Activo" || p.Estado === "Disponible" ? "Disponible" : 
+                               p.Estado === "Agotado" ? "Agotado" : "No disponible"}
+                            </span>
+                          </td>
                           <td className="text-center">
                             <span style={{
                               fontSize: "1.3rem",

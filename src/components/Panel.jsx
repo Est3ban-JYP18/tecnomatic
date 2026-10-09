@@ -1,27 +1,54 @@
 import { useState, useEffect } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import Swal from "sweetalert2";
+import ReciboModal from "./ReciboModal";
 
 function Panel({ usuario }) {
+  const [vista, setVista] = useState("recibos"); // "recibos" o "manual"
+  const [recibos, setRecibos] = useState([]);
+  const [loadingRecibos, setLoadingRecibos] = useState(true);
+  const [busqueda, setBusqueda] = useState("");
+  const [filtroEstado, setFiltroEstado] = useState("Todos");
+
+  // Modal de Detalle de Recibo de Compra
+  const [reciboModalActivo, setReciboModalActivo] = useState(null);
+  const [detallesRecibo, setDetallesRecibo] = useState([]);
+  const [cargandoDetalle, setCargandoDetalle] = useState(false);
+
+  // Estados para emisión manual de recibos (POS)
   const [productosBD, setProductosBD] = useState([]);
   const [productoSeleccionado, setProductoSeleccionado] = useState(null);
-  
   const [nombre, setNombre] = useState("");
   const [precio, setPrecio] = useState("");
   const [cantidad, setCantidad] = useState(1);
-
   const [items, setItems] = useState([]);
-  const [facturas, setFacturas] = useState([]);
 
-  // Cargar productos de la base de datos
+  // Cargar lista de recibos desde el backend
+  const cargarRecibos = async () => {
+    setLoadingRecibos(true);
+    try {
+      const res = await fetch("http://localhost:3001/recibos");
+      if (res.ok) {
+        const data = await res.json();
+        setRecibos(data);
+      }
+    } catch (err) {
+      console.warn("Error al cargar recibos de compra:", err.message);
+    } finally {
+      setLoadingRecibos(false);
+    }
+  };
+
+  // Cargar productos para emisión manual
   useEffect(() => {
+    cargarRecibos();
     fetch("http://localhost:3001/productos")
       .then((res) => res.json())
       .then((data) => setProductosBD(data))
-      .catch((err) => console.error("Error cargando productos para facturación:", err));
+      .catch((err) => console.error("Error cargando productos:", err));
   }, []);
 
-  // Al seleccionar un producto, autocompletar el precio
+  // Al seleccionar producto en emisión manual
   const handleSelectProducto = (e) => {
     const val = e.target.value;
     setNombre(val);
@@ -35,13 +62,35 @@ function Panel({ usuario }) {
     }
   };
 
-  // AGREGAR PRODUCTO A LA FACTURA
+  // Abrir modal de detalle completo del recibo al tocar [ Ver recibo ]
+  const handleVerRecibo = async (r) => {
+    setReciboModalActivo(r);
+    setCargandoDetalle(true);
+    setDetallesRecibo([]);
+
+    try {
+      const res = await fetch(`http://localhost:3001/recibos/${r.idFacturas || r.id}`);
+      if (res.ok) {
+        const data = await res.json();
+        setDetallesRecibo(data.detalles || []);
+        if (data.recibo) {
+          setReciboModalActivo({ ...r, ...data.recibo });
+        }
+      }
+    } catch (err) {
+      console.warn("Nota al cargar detalles de recibo:", err.message);
+    } finally {
+      setCargandoDetalle(false);
+    }
+  };
+
+  // Agregar item en emisión manual
   const agregarItem = () => {
     if (!nombre || !productoSeleccionado) {
       Swal.fire({
         icon: "warning",
         title: "Selecciona un producto",
-        text: "Por favor elige un producto del listado.",
+        text: "Por favor elige un producto del catálogo.",
         confirmButtonColor: "#0047AB"
       });
       return;
@@ -50,16 +99,7 @@ function Panel({ usuario }) {
       Swal.fire({
         icon: "warning",
         title: "Precio no válido",
-        text: "Ingresa un valor numérico mayor a cero para el precio.",
-        confirmButtonColor: "#0047AB"
-      });
-      return;
-    }
-    if (Number(cantidad) <= 0) {
-      Swal.fire({
-        icon: "warning",
-        title: "Cantidad no válida",
-        text: "La cantidad debe ser mínimo 1.",
+        text: "Ingresa un valor numérico mayor a cero.",
         confirmButtonColor: "#0047AB"
       });
       return;
@@ -73,43 +113,27 @@ function Panel({ usuario }) {
     };
 
     setItems([...items, nuevo]);
-
-    // Reset fields
     setNombre("");
     setPrecio("");
     setCantidad(1);
     setProductoSeleccionado(null);
   };
 
-  // ELIMINAR ITEM
   const eliminarItem = (index) => {
     setItems(items.filter((_, i) => i !== index));
   };
 
-  // TOTAL ACTUAL
-  const total = items.reduce(
-    (acc, item) => acc + item.precio * item.cantidad,
-    0
-  );
+  const totalManual = items.reduce((acc, item) => acc + item.precio * item.cantidad, 0);
 
-  // FINALIZAR FACTURA EN BASE DE DATOS
-  const finalizarFactura = async () => {
-    if (items.length === 0) {
-      Swal.fire({
-        icon: "warning",
-        title: "Factura vacía",
-        text: "Agrega productos a la factura antes de finalizarla.",
-        confirmButtonColor: "#0047AB"
-      });
-      return;
-    }
+  // Finalizar recibo manual
+  const finalizarReciboManual = async () => {
+    if (items.length === 0) return;
 
-    // El contador que registra la factura
-    const idUsuario = usuario?.idUsuarios || 1; // ID de respaldo en caso de sesión expuesta
-
+    const idUsuario = usuario?.idUsuarios || usuario?.id || 1;
     const dataPedido = {
       idUsuario,
-      total,
+      total: totalManual,
+      estado: "Pagado",
       productos: items.map((item) => ({
         idProducto: item.idProductos,
         cantidad: item.cantidad,
@@ -118,283 +142,431 @@ function Panel({ usuario }) {
     };
 
     try {
-      const res = await fetch("http://localhost:3001/pedidos", {
+      const res = await fetch("http://localhost:3001/recibos", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(dataPedido)
       });
 
-      if (!res.ok) throw new Error("Error en base de datos al guardar la factura");
+      if (!res.ok) throw new Error("Error al guardar el recibo");
       const resData = await res.json();
-
-      const nuevaFactura = {
-        id: resData.idFactura || Date.now(),
-        productos: items,
-        total,
-      };
-
-      setFacturas([nuevaFactura, ...facturas]);
-      setItems([]);
 
       Swal.fire({
         icon: "success",
-        title: "Factura Registrada",
-        text: `Factura #${nuevaFactura.id} guardada en MySQL y stock actualizado.`,
-        confirmButtonColor: "#20B2AA",
-        customClass: {
-          popup: 'rounded-4'
-        }
+        title: "Recibo de Compra Emitido",
+        text: `Recibo #${resData.numeroRecibo || resData.idFactura} registrado para control contable.`,
+        confirmButtonColor: "#20B2AA"
       });
 
+      setItems([]);
+      cargarRecibos();
+      setVista("recibos");
     } catch (error) {
       console.error(error);
       Swal.fire({
         icon: "error",
-        title: "Error de registro",
-        text: "No se pudo registrar la factura en la base de datos MySQL.",
+        title: "Error",
+        text: "No se pudo registrar el recibo en la base de datos.",
         confirmButtonColor: "#0047AB"
       });
     }
   };
 
+  // Filtrado de recibos para la vista
+  const recibosFiltrados = recibos.filter((r) => {
+    const q = busqueda.toLowerCase().trim();
+    const matchBusqueda =
+      !q ||
+      (r.clienteNombre || "").toLowerCase().includes(q) ||
+      (r.Nombres || "").toLowerCase().includes(q) ||
+      (r.Apellidos || "").toLowerCase().includes(q) ||
+      (r.Numero_Recibo || "").toLowerCase().includes(q) ||
+      String(r.idFacturas || "").includes(q);
+
+    const matchEstado =
+      filtroEstado === "Todos" ||
+      (r.Estado || "Pagado").toLowerCase() === filtroEstado.toLowerCase();
+
+    return matchBusqueda && matchEstado;
+  });
+
+  // Métricas contables
+  const totalIngresos = recibos.reduce((acc, r) => acc + Number(r.Total || 0), 0);
+  const totalPagados = recibos.filter((r) => (r.Estado || "Pagado").toLowerCase() === "pagado" || (r.Estado || "").toLowerCase() === "compra realizada").length;
+  const totalPendientes = recibos.filter((r) => (r.Estado || "").toLowerCase() === "pendiente").length;
+
   return (
     <motion.div 
       initial={{ opacity: 0, y: 10 }}
       animate={{ opacity: 1, y: 0 }}
-      transition={{ duration: 0.5 }}
-      className="container py-5"
+      transition={{ duration: 0.4 }}
+      className="container py-4"
     >
-      <div className="mb-4">
-        <h3 className="fw-bold mb-1" style={{ color: "#0047AB" }}>📊 Panel de Facturación (POS)</h3>
-        <p className="text-muted" style={{ fontSize: "14px" }}>Genera facturas oficiales y asienta las salidas directamente en la base de datos MySQL.</p>
+      {/* MODAL OFICIAL DEL RECIBO */}
+      {reciboModalActivo && (
+        <ReciboModal 
+          recibo={reciboModalActivo} 
+          detalles={detallesRecibo} 
+          onClose={() => setReciboModalActivo(null)} 
+        />
+      )}
+
+      {/* ENCABEZADO Y TABS */}
+      <div className="d-flex flex-column flex-md-row justify-content-between align-items-md-center mb-4 gap-3">
+        <div>
+          <h3 className="fw-extrabold mb-1" style={{ color: "#0047AB", letterSpacing: "0.5px" }}>
+            <i className="bi bi-receipt me-2" style={{ color: "#20B2AA" }}></i>
+            Módulo de Generar Recibos y Control Contable
+          </h3>
+          <p className="text-muted mb-0" style={{ fontSize: "14px" }}>
+            Visualiza en tiempo real los recibos de compras emitidos por clientes y emite recibos oficiales.
+          </p>
+        </div>
+
+        {/* NAVEGACIÓN ENTRE BANDEJA Y EMISIÓN MANUAL */}
+        <div className="d-flex gap-2">
+          <button
+            onClick={() => setVista("recibos")}
+            className={`btn fw-bold px-3 py-2 d-flex align-items-center gap-1.5 ${
+              vista === "recibos" ? "btn-primary" : "btn-outline-secondary"
+            }`}
+            style={{
+              backgroundColor: vista === "recibos" ? "#0047AB" : "transparent",
+              borderColor: vista === "recibos" ? "#0047AB" : "#CBD5E1",
+              borderRadius: "12px",
+              fontSize: "13.5px"
+            }}
+          >
+            <i className="bi bi-card-list"></i> Recibos de Compra ({recibos.length})
+          </button>
+
+          <button
+            onClick={() => setVista("manual")}
+            className={`btn fw-bold px-3 py-2 d-flex align-items-center gap-1.5 ${
+              vista === "manual" ? "text-white" : "btn-outline-primary"
+            }`}
+            style={{
+              backgroundColor: vista === "manual" ? "#20B2AA" : "transparent",
+              borderColor: "#20B2AA",
+              color: vista === "manual" ? "#fff" : "#20B2AA",
+              borderRadius: "12px",
+              fontSize: "13.5px"
+            }}
+          >
+            <i className="bi bi-plus-circle"></i> Emitir Recibo Manual
+          </button>
+        </div>
       </div>
 
-      <div className="row g-4">
-        
-        {/* PARTE IZQUIERDA: FORMULARIO Y TABLA DE PROCESO */}
-        <div className="col-lg-8">
-          
-          {/* FORMULARIO AGREGAR */}
-          <div className="card border-0 shadow-sm p-4 mb-4" style={{ borderRadius: "20px" }}>
-            <h5 className="fw-bold mb-3" style={{ color: "#0047AB", fontSize: "16px" }}>
-              <i className="bi bi-cart-plus me-1.5"></i> Agregar Concepto
-            </h5>
-            
-            <div className="row g-2 align-items-end">
-              {/* Seleccionar Producto */}
-              <div className="col-md-4">
-                <label className="form-label fw-semibold">Producto en Base de Datos</label>
-                <select
-                  className="form-select"
-                  value={nombre}
-                  onChange={handleSelectProducto}
-                >
-                  <option value="">Seleccionar producto...</option>
-                  {productosBD.map((p) => (
-                    <option key={p.idProductos} value={p.Nombre_Producto}>
-                      {p.Nombre_Producto}
-                    </option>
-                  ))}
-                </select>
-              </div>
-
-              {/* Precio */}
-              <div className="col-md-3">
-                <label className="form-label fw-semibold">Precio Unitario ($)</label>
-                <input
-                  type="number"
-                  className="form-control"
-                  placeholder="Ej. 75000"
-                  value={precio}
-                  onChange={(e) => setPrecio(e.target.value)}
-                />
-              </div>
-
-              {/* Cantidad */}
-              <div className="col-md-2">
-                <label className="form-label fw-semibold">Cantidad</label>
-                <input
-                  type="number"
-                  className="form-control text-center"
-                  placeholder="Cant."
-                  value={cantidad}
-                  min="1"
-                  onChange={(e) => setCantidad(e.target.value)}
-                />
-              </div>
-
-              {/* Botón */}
-              <div className="col-md-3">
-                <button 
-                  className="btn text-white fw-semibold w-100 py-2.5" 
-                  style={{
-                    backgroundColor: "#20B2AA",
-                    borderRadius: "12px",
-                    boxShadow: "0 4px 12px rgba(32, 178, 170, 0.2)",
-                    transition: "all 0.2s"
-                  }}
-                  onClick={agregarItem}
-                  onMouseEnter={(e) => e.currentTarget.style.backgroundColor = "#1a908a"}
-                  onMouseLeave={(e) => e.currentTarget.style.backgroundColor = "#20B2AA"}
-                >
-                  <i className="bi bi-plus-lg me-1"></i> Agregar
-                </button>
-              </div>
-            </div>
-          </div>
-
-          {/* DETALLE DE FACTURA ACTUAL */}
-          <div className="card border-0 shadow-sm p-4" style={{ borderRadius: "20px" }}>
-            <h5 className="fw-bold mb-3" style={{ color: "#0047AB", fontSize: "16px" }}>
-              <i className="bi bi-receipt me-1.5"></i> Factura en Proceso
-            </h5>
-
-            <div className="table-responsive mt-2">
-              <table className="table align-middle">
-                <thead style={{ backgroundColor: "#f8fafc" }}>
-                  <tr>
-                    <th className="border-0 px-3 py-2 text-secondary" style={{ fontSize: "12px" }}>PRODUCTO</th>
-                    <th className="border-0 px-3 py-2 text-secondary" style={{ fontSize: "12px" }}>PRECIO</th>
-                    <th className="border-0 px-3 py-2 text-secondary text-center" style={{ fontSize: "12px" }}>CANTIDAD</th>
-                    <th className="border-0 px-3 py-2 text-secondary text-end" style={{ fontSize: "12px" }}>SUBTOTAL</th>
-                    <th className="border-0 px-3 py-2" style={{ width: "50px" }}></th>
-                  </tr>
-                </thead>
-                <tbody>
-                  <AnimatePresence initial={false}>
-                    {items.length === 0 ? (
-                      <tr>
-                        <td colSpan="5" className="text-center py-4 text-muted" style={{ fontSize: "13.5px" }}>
-                          No hay productos en la factura actual. Agrega conceptos arriba.
-                        </td>
-                      </tr>
-                    ) : (
-                      items.map((item, i) => (
-                        <motion.tr 
-                          key={i}
-                          initial={{ opacity: 0, y: -5 }}
-                          animate={{ opacity: 1, y: 0 }}
-                          exit={{ opacity: 0, x: -10 }}
-                          transition={{ duration: 0.2 }}
-                        >
-                          <td className="px-3 py-2.5 fw-semibold text-dark">{item.nombre}</td>
-                          <td className="px-3 py-2.5">${item.precio.toLocaleString()}</td>
-                          <td className="px-3 py-2.5 text-center">{item.cantidad}</td>
-                          <td className="px-3 py-2.5 text-end fw-bold" style={{ color: "#0047AB" }}>
-                            ${(item.precio * item.cantidad).toLocaleString()}
-                          </td>
-                          <td className="px-3 py-2.5 text-center">
-                            <button
-                              className="btn btn-sm btn-outline-danger border-0 rounded-circle"
-                              onClick={() => eliminarItem(i)}
-                              title="Remover"
-                              style={{ width: "30px", height: "30px", padding: 0 }}
-                            >
-                              <i className="bi bi-x"></i>
-                            </button>
-                          </td>
-                        </motion.tr>
-                      ))
-                    )}
-                  </AnimatePresence>
-                </tbody>
-              </table>
-            </div>
-
-            {/* SECCIÓN TOTAL */}
-            <div className="d-flex justify-content-between align-items-center mt-3 pt-3 border-top">
-              <h5 className="fw-bold mb-0 text-muted" style={{ fontSize: "15px" }}>Total a Facturar:</h5>
-              <h4 className="fw-extrabold mb-0" style={{ color: "#0047AB" }}>${total.toLocaleString()}</h4>
-            </div>
-
-            <button
-              className="btn text-white fw-bold py-3 mt-4"
-              onClick={finalizarFactura}
-              disabled={items.length === 0}
-              style={{
-                background: "linear-gradient(135deg, #0047AB 0%, #20B2AA 100%)",
-                border: "none",
-                borderRadius: "14px",
-                fontSize: "15px",
-                boxShadow: items.length > 0 ? "0 4px 18px rgba(32, 178, 170, 0.3)" : "none",
-                transition: "all 0.3s"
-              }}
-              onMouseEnter={(e) => {
-                if(items.length > 0) {
-                  e.currentTarget.style.transform = "translateY(-1px)";
-                  e.currentTarget.style.boxShadow = "0 8px 22px rgba(32, 178, 170, 0.4)";
-                }
-              }}
-              onMouseLeave={(e) => {
-                if(items.length > 0) {
-                  e.currentTarget.style.transform = "translateY(0)";
-                  e.currentTarget.style.boxShadow = "0 4px 18px rgba(32, 178, 170, 0.3)";
-                }
-              }}
-            >
-              <i className="bi bi-file-earmark-check me-1.5"></i> Finalizar y Registrar Factura
-            </button>
+      {/* TARJETAS DE MÉTRICAS CONTABLES */}
+      <div className="row g-3 mb-4">
+        <div className="col-sm-6 col-lg-3">
+          <div className="card border-0 shadow-sm p-3 h-100" style={{ borderRadius: "16px", backgroundColor: "#F8FAFC" }}>
+            <div className="text-muted small fw-semibold mb-1">Total Recibos</div>
+            <h4 className="fw-extrabold mb-0" style={{ color: "#0047AB" }}>{recibos.length}</h4>
+            <div className="small text-muted mt-1">Registrados en el sistema</div>
           </div>
         </div>
 
-        {/* PARTE DERECHA: HISTORIAL DE FACTURAS */}
-        <div className="col-lg-4">
-          <div className="card border-0 shadow-sm p-4 h-100" style={{ borderRadius: "20px" }}>
-            <h5 className="fw-bold mb-3" style={{ color: "#0047AB", fontSize: "16px" }}>
-              <i className="bi bi-clock-history me-1.5"></i> Historial Reciente
-            </h5>
+        <div className="col-sm-6 col-lg-3">
+          <div className="card border-0 shadow-sm p-3 h-100" style={{ borderRadius: "16px", backgroundColor: "#F0FDF4" }}>
+            <div className="text-muted small fw-semibold mb-1">Volumen Ingresos</div>
+            <h4 className="fw-extrabold mb-0 text-success">${totalIngresos.toLocaleString("es-CO")}</h4>
+            <div className="small text-muted mt-1">Recaudación total asentada</div>
+          </div>
+        </div>
 
-            <div className="d-flex flex-column gap-3 mt-2" style={{ maxHeight: "490px", overflowY: "auto", paddingRight: "4px" }}>
-              <AnimatePresence initial={false}>
-                {facturas.length === 0 ? (
-                  <div className="text-center py-5 text-muted">
-                    <i className="bi bi-receipt-cutoff" style={{ fontSize: "2rem" }}></i>
-                    <p className="mt-2 mb-0" style={{ fontSize: "13px" }}>No se han generado facturas en esta sesión.</p>
-                  </div>
-                ) : (
-                  facturas.map((factura) => (
+        <div className="col-sm-6 col-lg-3">
+          <div className="card border-0 shadow-sm p-3 h-100" style={{ borderRadius: "16px", backgroundColor: "#EFF6FF" }}>
+            <div className="text-muted small fw-semibold mb-1">Recibos Pagados</div>
+            <h4 className="fw-extrabold mb-0 text-primary">{totalPagados}</h4>
+            <div className="small text-muted mt-1">Transacciones liquidadas</div>
+          </div>
+        </div>
+
+        <div className="col-sm-6 col-lg-3">
+          <div className="card border-0 shadow-sm p-3 h-100" style={{ borderRadius: "16px", backgroundColor: "#FEFCE8" }}>
+            <div className="text-muted small fw-semibold mb-1">Recibos Pendientes</div>
+            <h4 className="fw-extrabold mb-0 text-warning">{totalPendientes}</h4>
+            <div className="small text-muted mt-1">Por confirmar o despachar</div>
+          </div>
+        </div>
+      </div>
+
+      {/* VISTA 1: RECIBOS DE COMPRA (DISEÑO SOLICITADO) */}
+      {vista === "recibos" && (
+        <div className="card border-0 shadow-sm p-4" style={{ borderRadius: "20px" }}>
+          
+          {/* HEADER DE LA SECCIÓN SOLICITADA */}
+          <div className="text-center pb-3 mb-3 border-bottom">
+            <h4 className="fw-extrabold mb-1" style={{ color: "#0047AB", letterSpacing: "1px" }}>
+              RECIBOS DE COMPRA
+            </h4>
+            <p className="text-muted small mb-0">Listado oficial de compras realizadas para control y emisión contable</p>
+          </div>
+
+          {/* FILTROS Y BÚSQUEDA */}
+          <div className="row g-2 mb-4 align-items-center">
+            <div className="col-md-7">
+              <div className="input-group">
+                <span className="input-group-text bg-white border-end-0" style={{ borderRadius: "12px 0 0 12px" }}>
+                  <i className="bi bi-search text-muted"></i>
+                </span>
+                <input
+                  type="text"
+                  className="form-control border-start-0"
+                  style={{ borderRadius: "0 12px 12px 0" }}
+                  placeholder="Buscar por cliente o N° de recibo (ej: RC-0001)..."
+                  value={busqueda}
+                  onChange={(e) => setBusqueda(e.target.value)}
+                />
+              </div>
+            </div>
+
+            <div className="col-md-5 d-flex justify-content-md-end gap-2">
+              {["Todos", "Pagado", "Pendiente"].map((est) => (
+                <button
+                  key={est}
+                  onClick={() => setFiltroEstado(est)}
+                  className={`btn btn-sm fw-semibold px-3 py-1.5 rounded-pill ${
+                    filtroEstado === est ? "btn-primary text-white" : "btn-light text-secondary"
+                  }`}
+                  style={{
+                    backgroundColor: filtroEstado === est ? "#0047AB" : "#F1F5F9",
+                    border: "none",
+                    fontSize: "12px"
+                  }}
+                >
+                  {est}
+                </button>
+              ))}
+              <button 
+                onClick={cargarRecibos} 
+                className="btn btn-sm btn-outline-secondary rounded-pill px-2.5"
+                title="Actualizar"
+              >
+                <i className="bi bi-arrow-clockwise"></i>
+              </button>
+            </div>
+          </div>
+
+          {/* CONTENEDOR DE TARJETAS SOLICITADO */}
+          {loadingRecibos ? (
+            <div className="text-center py-5 text-muted">
+              <div className="spinner-border text-primary mb-3" role="status"></div>
+              <p className="mb-0">Cargando recibos de compra en tiempo real...</p>
+            </div>
+          ) : recibosFiltrados.length === 0 ? (
+            <div className="text-center py-5 text-muted">
+              <i className="bi bi-receipt-cutoff fs-1 d-block mb-2"></i>
+              <h6 className="fw-bold">No se encontraron recibos de compra</h6>
+              <p className="small mb-0">No hay compras registradas con los filtros aplicados.</p>
+            </div>
+          ) : (
+            <div className="row g-3">
+              {recibosFiltrados.map((recibo) => {
+                const numRecibo = recibo.Numero_Recibo || `RC-${String(recibo.idFacturas || recibo.id).padStart(4, "0")}`;
+                const cliente = recibo.clienteNombre || 
+                  (recibo.Nombres ? `${recibo.Nombres} ${recibo.Apellidos || ""}`.trim() : recibo.cliente || "Cliente General");
+                
+                const fecha = recibo.Fecha ? new Date(recibo.Fecha).toLocaleDateString("es-CO", {
+                  day: "2-digit",
+                  month: "2-digit",
+                  year: "numeric"
+                }) : "20/09/2026";
+
+                const totalStr = Number(recibo.Total || 0).toLocaleString("es-CO");
+
+                return (
+                  <div key={recibo.idFacturas || recibo.id} className="col-md-6 col-lg-4">
+                    {/* TARJETA CON EL FORMATO EXACTO SOLICITADO */}
                     <motion.div 
-                      key={factura.id}
-                      initial={{ opacity: 0, scale: 0.95 }}
-                      animate={{ opacity: 1, scale: 1 }}
-                      exit={{ opacity: 0 }}
-                      className="p-3 rounded-4" 
+                      whileHover={{ y: -3, boxShadow: "0 8px 24px rgba(0, 71, 171, 0.12)" }}
+                      className="card border h-100 p-3"
                       style={{ 
-                        backgroundColor: "#f8fafc",
-                        border: "1px solid rgba(0,0,0,0.04)"
+                        borderRadius: "16px",
+                        backgroundColor: "#FFFFFF",
+                        borderColor: "#E2E8F0"
                       }}
                     >
-                      <div className="d-flex justify-content-between mb-2 pb-1 border-bottom">
-                        <span className="fw-bold text-secondary" style={{ fontSize: "12.5px" }}>
-                          Factura #{factura.id}
+                      <div className="d-flex justify-content-between align-items-center mb-2">
+                        <span 
+                          className="fw-extrabold fs-5" 
+                          style={{ color: "#0047AB", letterSpacing: "0.5px" }}
+                        >
+                          {numRecibo}
                         </span>
-                        <span className="small text-muted">
-                          Facturado
+                        <span 
+                          className={`badge rounded-pill px-2.5 py-1 ${
+                            (recibo.Estado || "Pagado").toLowerCase() === "pagado" || (recibo.Estado || "").toLowerCase() === "compra realizada"
+                              ? "bg-success"
+                              : "bg-warning text-dark"
+                          }`}
+                          style={{ fontSize: "10.5px", fontWeight: "700" }}
+                        >
+                          {(recibo.Estado || "Pagado").toUpperCase()}
                         </span>
                       </div>
 
-                      <div className="d-flex flex-column gap-1 mb-2">
-                        {factura.productos.map((p, i) => (
-                          <div key={i} className="d-flex justify-content-between text-muted" style={{ fontSize: "13px" }}>
-                            <span>{p.nombre} ({p.cantidad})</span>
-                            <span>${(p.precio * p.cantidad).toLocaleString()}</span>
-                          </div>
-                        ))}
+                      <div className="d-flex flex-column gap-1 mb-3 text-secondary" style={{ fontSize: "13.5px" }}>
+                        <div>
+                          <span className="text-muted fw-medium">Cliente:</span>{" "}
+                          <strong className="text-dark">{cliente}</strong>
+                        </div>
+                        <div>
+                          <span className="text-muted fw-medium">Fecha:</span>{" "}
+                          <strong className="text-dark">{fecha}</strong>
+                        </div>
+                        <div>
+                          <span className="text-muted fw-medium">Total:</span>{" "}
+                          <strong style={{ color: "#0047AB", fontSize: "15px" }}>${totalStr}</strong>
+                        </div>
                       </div>
 
-                      <div className="d-flex justify-content-between pt-1 border-top fw-bold text-dark" style={{ fontSize: "13.5px" }}>
-                        <span>TOTAL</span>
-                        <span style={{ color: "#0047AB" }}>${factura.total.toLocaleString()}</span>
+                      <div className="mt-auto pt-2 border-top">
+                        <button
+                          onClick={() => handleVerRecibo(recibo)}
+                          className="btn w-100 fw-bold py-2 d-flex align-items-center justify-content-center gap-1.5"
+                          style={{
+                            background: "linear-gradient(135deg, #0047AB 0%, #20B2AA 100%)",
+                            color: "#ffffff",
+                            border: "none",
+                            borderRadius: "10px",
+                            fontSize: "13.5px",
+                            boxShadow: "0 3px 12px rgba(32, 178, 170, 0.25)"
+                          }}
+                        >
+                          <i className="bi bi-receipt-cutoff"></i> Ver recibo
+                        </button>
                       </div>
                     </motion.div>
-                  ))
-                )}
-              </AnimatePresence>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+
+        </div>
+      )}
+
+      {/* VISTA 2: EMISIÓN MANUAL DE RECIBO (FORMULARIO POS) */}
+      {vista === "manual" && (
+        <div className="card border-0 shadow-sm p-4" style={{ borderRadius: "20px" }}>
+          <h5 className="fw-bold mb-3" style={{ color: "#0047AB" }}>
+            <i className="bi bi-pencil-square me-2"></i> Emisión Manual de Recibo de Compra
+          </h5>
+
+          <div className="row g-2 align-items-end mb-4">
+            <div className="col-md-5">
+              <label className="form-label small fw-semibold">Producto del Catálogo</label>
+              <select className="form-select" value={nombre} onChange={handleSelectProducto}>
+                <option value="">Seleccionar artículo...</option>
+                {productosBD.map((p) => (
+                  <option key={p.idProductos} value={p.Nombre_Producto}>
+                    {p.Nombre_Producto} (${Number(p.Precio).toLocaleString("es-CO")})
+                  </option>
+                ))}
+              </select>
+            </div>
+
+            <div className="col-md-3">
+              <label className="form-label small fw-semibold">Precio Unitario ($)</label>
+              <input
+                type="number"
+                className="form-control"
+                placeholder="Precio"
+                value={precio}
+                onChange={(e) => setPrecio(e.target.value)}
+              />
+            </div>
+
+            <div className="col-md-2">
+              <label className="form-label small fw-semibold">Cantidad</label>
+              <input
+                type="number"
+                min="1"
+                className="form-control text-center"
+                value={cantidad}
+                onChange={(e) => setCantidad(e.target.value)}
+              />
+            </div>
+
+            <div className="col-md-2">
+              <button
+                className="btn text-white fw-bold w-100 py-2"
+                style={{ backgroundColor: "#20B2AA", borderRadius: "10px" }}
+                onClick={agregarItem}
+              >
+                <i className="bi bi-plus-lg"></i> Agregar
+              </button>
             </div>
           </div>
-        </div>
 
-      </div>
+          {/* TABLA DE CONCEPTOS AGREGADOS */}
+          <div className="table-responsive mb-3">
+            <table className="table align-middle">
+              <thead style={{ backgroundColor: "#F8FAFC" }}>
+                <tr>
+                  <th className="small text-muted py-2 px-3 border-0">PRODUCTO</th>
+                  <th className="small text-muted py-2 px-3 border-0 text-center">CANTIDAD</th>
+                  <th className="small text-muted py-2 px-3 border-0 text-end">PRECIO</th>
+                  <th className="small text-muted py-2 px-3 border-0 text-end">SUBTOTAL</th>
+                  <th className="border-0" style={{ width: "40px" }}></th>
+                </tr>
+              </thead>
+              <tbody>
+                {items.length === 0 ? (
+                  <tr>
+                    <td colSpan="5" className="text-center py-4 text-muted small">
+                      No hay artículos agregados al recibo en proceso.
+                    </td>
+                  </tr>
+                ) : (
+                  items.map((item, idx) => (
+                    <tr key={idx}>
+                      <td className="fw-semibold px-3">{item.nombre}</td>
+                      <td className="text-center px-3">{item.cantidad}</td>
+                      <td className="text-end px-3 text-muted">${item.precio.toLocaleString("es-CO")}</td>
+                      <td className="text-end px-3 fw-bold text-primary">
+                        ${(item.precio * item.cantidad).toLocaleString("es-CO")}
+                      </td>
+                      <td className="text-center px-3">
+                        <button
+                          className="btn btn-sm btn-outline-danger border-0 rounded-circle"
+                          onClick={() => eliminarItem(idx)}
+                        >
+                          <i className="bi bi-trash"></i>
+                        </button>
+                      </td>
+                    </tr>
+                  ))
+                )}
+              </tbody>
+            </table>
+          </div>
+
+          {/* TOTAL Y ACCIÓN FINALIZAR */}
+          <div className="d-flex justify-content-between align-items-center pt-3 border-top">
+            <span className="fw-bold fs-6 text-muted">Total a Asentar:</span>
+            <span className="fw-extrabold fs-4" style={{ color: "#0047AB" }}>
+              ${totalManual.toLocaleString("es-CO")}
+            </span>
+          </div>
+
+          <button
+            onClick={finalizarReciboManual}
+            disabled={items.length === 0}
+            className="btn text-white fw-bold py-2.5 mt-3 w-100"
+            style={{
+              background: "linear-gradient(135deg, #0047AB 0%, #20B2AA 100%)",
+              borderRadius: "12px"
+            }}
+          >
+            <i className="bi bi-check2-circle me-1"></i> Asentar y Generar Recibo de Compra
+          </button>
+        </div>
+      )}
+
     </motion.div>
   );
 }

@@ -2,6 +2,8 @@ const express = require("express");
 const mysql = require("mysql2");
 const cors = require("cors");
 const jwt = require("jsonwebtoken");
+const fs = require("fs");
+const path = require("path");
 const verifyToken = require("./middleware/verifyToken");
 require("dotenv").config();
 
@@ -17,6 +19,21 @@ const { MercadoPagoConfig, Preference, Payment } = require("mercadopago");
 const app = express();
 app.use(cors());
 app.use(express.json());
+
+// ============================================================
+// CLIENTE SUPABASE (Si están configuradas las credenciales)
+// ============================================================
+let supabase = null;
+if (process.env.SUPABASE_URL && process.env.SUPABASE_KEY) {
+  try {
+    const { createClient } = require("@supabase/supabase-js");
+    supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
+    console.log("⚡ Supabase inicializado correctamente");
+  } catch (err) {
+    console.warn("⚠️ No se pudo inicializar Supabase:", err.message);
+  }
+}
+
 
 const codigosRecuperacion = new Map();
 
@@ -69,10 +86,45 @@ const db = mysql.createConnection({
 
 db.connect((err) => {
   if (err) console.error(" Error MySQL:", err.message);
-  else console.log(" MySQL conectado");
+  else {
+    console.log(" MySQL conectado");
+    const rutaMigracion = path.join(__dirname, "migrations", "20260819_catalogo_crud.sql");
+    const sentencias = fs.readFileSync(rutaMigracion, "utf8").split(/;\s*\r?\n/).map((sql) => sql.trim()).filter(Boolean);
+    const ejecutar = (indice) => {
+      if (indice >= sentencias.length) {
+        // Ejecutar migración de Facturas / Recibos
+        const rutaFacturas = path.join(__dirname, "migrations", "20260921_facturas_recibos.sql");
+        if (fs.existsSync(rutaFacturas)) {
+          const sentenciasF = fs.readFileSync(rutaFacturas, "utf8").split(/;\s*\r?\n/).map((sql) => sql.trim()).filter(Boolean);
+          const ejecutarF = (idx) => {
+            if (idx >= sentenciasF.length) return console.log(" Migraciones completas (Catálogo y Facturas/Recibos)");
+            db.query(sentenciasF[idx], (errF) => {
+              if (errF) console.warn(" Nota en migración de facturas:", errF.sqlMessage);
+              ejecutarF(idx + 1);
+            });
+          };
+          ejecutarF(0);
+        }
+        return;
+      }
+      db.query(sentencias[indice], (error) => {
+        if (error) return console.error(" Error en migración de catálogo:", error.sqlMessage);
+        ejecutar(indice + 1);
+      });
+    };
+    ejecutar(0);
+  }
 });
 
 db.on("error", (err) => console.error(" Error conexión MySQL:", err));
+
+const registrarAuditoriaProducto = (idProducto, idUsuario, accion, detalle) => {
+  db.query(
+    "INSERT INTO Auditoria_Productos (Productos_idProductos, Usuarios_idUsuarios, Accion, Detalle) VALUES (?, ?, ?, ?)",
+    [idProducto, idUsuario || null, accion, detalle || null],
+    (error) => error && console.error("Error registrando auditoría:", error.sqlMessage),
+  );
+};
 
 
 app.get("/hola", (req, res) => {
@@ -97,7 +149,21 @@ app.get("/admin/usuarios", (req, res) => {
   `;
 
   db.query(query, (err, result) => {
-    if (err) return res.status(500).json({ error: err.sqlMessage });
+    if (err) {
+      console.error("====================================");
+      console.error("ERROR AL CONSULTAR USUARIOS");
+      console.error(err);
+      console.error("====================================");
+
+      return res.status(500).json({
+        error: err.message || "Error desconocido de MySQL",
+        code: err.code || null,
+        sqlMessage: err.sqlMessage || null,
+      });
+    }
+
+    console.log("USUARIOS CONSULTADOS:", result.length);
+
     res.json(result);
   });
 });
@@ -253,17 +319,31 @@ app.get("/perfil", verifyToken, (req, res) => {
 });
 
 app.get("/productos", (req, res) => {
-  const { categoria, precioMax } = req.query;
+  const { categoria, precioMax, disponible, proteccion, material, marca, precioMin, precioMaximo } = req.query;
   let query = `
     SELECT p.idProductos, p.Nombre_Producto, p.Tipo, p.Descripcion,
-           p.Precio, p.Estado, p.Imagen, c.nombre AS Categoria
+           p.Precio, p.Estado, p.Imagen, c.nombre AS Categoria,
+           COALESCE(a.Marca, '') AS Marca, COALESCE(a.Material, '') AS Material,
+           COALESCE(a.Nivel_Proteccion, '') AS Nivel_Proteccion, COALESCE(a.Stock_Minimo, 5) AS Stock_Minimo,
+           CASE WHEN COUNT(v.idProductoVariante) > 0 THEN SUM(v.Stock) ELSE COALESCE(s.Cantidad_Actual, 0) END AS Stock
     FROM Productos p
     JOIN Categoria_productos c ON p.Categoria_producto_idCategoria = c.idCategorias
-    WHERE p.Estado = 'Activo'
+    LEFT JOIN Stock s ON p.idProductos = s.Productos_idProductos
+    LEFT JOIN Producto_Atributos a ON a.Productos_idProductos = p.idProductos
+    LEFT JOIN Producto_Variantes v ON v.Productos_idProductos = p.idProductos AND v.Activa = 1
+    LEFT JOIN Productos_Papelera papelera ON papelera.Productos_idProductos = p.idProductos
+    WHERE p.Estado IN ('Activo', 'Disponible', 'Agotado') AND papelera.Productos_idProductos IS NULL
   `;
   const params = [];
   if (categoria) { query += " AND c.nombre = ?"; params.push(categoria); }
   if (precioMax) { query += " AND p.Precio <= ?"; params.push(precioMax); }
+  if (precioMin) { query += " AND p.Precio >= ?"; params.push(precioMin); }
+  if (precioMaximo) { query += " AND p.Precio <= ?"; params.push(precioMaximo); }
+  if (proteccion) { query += " AND a.Nivel_Proteccion = ?"; params.push(proteccion); }
+  if (material) { query += " AND a.Material = ?"; params.push(material); }
+  if (marca) { query += " AND a.Marca = ?"; params.push(marca); }
+  query += " GROUP BY p.idProductos, c.nombre, a.Marca, a.Material, a.Nivel_Proteccion, a.Stock_Minimo, s.Cantidad_Actual";
+  if (disponible === "true") query += " HAVING Stock > 0";
   query += " ORDER BY c.nombre, p.Nombre_Producto";
 
   db.query(query, params, (err, result) => {
@@ -277,9 +357,18 @@ app.get("/admin/productos", (req, res) => {
   const query = `
     SELECT p.idProductos, p.Nombre_Producto, p.Tipo, p.Descripcion,
            p.Precio, p.Estado, p.Imagen, p.Categoria_producto_idCategoria,
-           c.nombre AS Categoria
+           c.nombre AS Categoria, COALESCE(a.Stock_Minimo, 5) AS Stock_Minimo,
+           COALESCE(a.Marca, '') AS Marca, COALESCE(a.Material, '') AS Material,
+           COALESCE(a.Nivel_Proteccion, '') AS Nivel_Proteccion,
+           CASE WHEN COUNT(v.idProductoVariante) > 0 THEN SUM(v.Stock) ELSE COALESCE(s.Cantidad_Actual, 0) END AS Stock
     FROM Productos p
     JOIN Categoria_productos c ON p.Categoria_producto_idCategoria = c.idCategorias
+    LEFT JOIN Stock s ON p.idProductos = s.Productos_idProductos
+    LEFT JOIN Producto_Atributos a ON a.Productos_idProductos = p.idProductos
+    LEFT JOIN Producto_Variantes v ON v.Productos_idProductos = p.idProductos AND v.Activa = 1
+    LEFT JOIN Productos_Papelera papelera ON papelera.Productos_idProductos = p.idProductos
+    WHERE papelera.Productos_idProductos IS NULL
+    GROUP BY p.idProductos, c.nombre, a.Stock_Minimo, a.Marca, a.Material, a.Nivel_Proteccion, s.Cantidad_Actual
     ORDER BY c.nombre, p.Nombre_Producto
   `;
   db.query(query, (err, result) => {
@@ -288,31 +377,248 @@ app.get("/admin/productos", (req, res) => {
   });
 });
 
-app.post("/admin/productos",verifyToken, (req, res) => {
-  const { nombre, tipo, descripcion, precio, imagen, categoria, estado } = req.body;
+app.post("/admin/productos", verifyToken, (req, res) => {
+  const { nombre, tipo, descripcion, precio, imagen, categoria, estado, stock } = req.body;
+  const stockNum = stock !== undefined ? Number(stock) : 0;
+  
+  let finalEstado = estado || "Activo";
+  if (stockNum === 0 && (finalEstado === "Activo" || finalEstado === "Disponible")) {
+    finalEstado = "Agotado";
+  } else if (stockNum > 0 && finalEstado === "Agotado") {
+    finalEstado = "Activo";
+  }
+
   const query = "INSERT INTO Productos (Nombre_Producto, Tipo, Descripcion, Precio, Imagen, Estado, Categoria_producto_idCategoria) VALUES (?, ?, ?, ?, ?, ?, ?)";
-  db.query(query, [nombre, tipo, descripcion, precio, imagen, estado || "Activo", categoria], (err, result) => {
+  db.query(query, [nombre, tipo, descripcion, precio, imagen, finalEstado, categoria], (err, result) => {
     if (err) return res.status(500).json({ error: err.sqlMessage });
 
-    
-    db.query("INSERT INTO Stock (Productos_idProductos, Cantidad_Actual) VALUES (?, 0)", [result.insertId], () => {});
-    res.status(201).json({ message: "Producto creado" });
+    const insertedId = result.insertId;
+    db.query("INSERT INTO Stock (Productos_idProductos, Cantidad_Actual) VALUES (?, ?)", [insertedId, stockNum], (errStock) => {
+      if (errStock) console.error("Error al insertar stock inicial:", errStock.sqlMessage);
+      
+      if (stockNum > 0) {
+        db.query(
+          "INSERT INTO Movimientos_Inventario (Productos_idProductos, Tipo_Movimiento, Cantidad, Observacion) VALUES (?, 'Entrada', ?, ?)",
+          [insertedId, stockNum, "Inventario inicial"],
+          (errMov) => {
+            if (errMov) console.error("Error al registrar movimiento inicial:", errMov.sqlMessage);
+          }
+        );
+      }
+    });
+
+    registrarAuditoriaProducto(insertedId, req.usuario?.id, "Creación", "Producto creado desde el CRUD");
+    res.status(201).json({ message: "Producto creado con éxito", idProducto: insertedId });
   });
 });
 
-app.put("/admin/productos/:id",verifyToken, (req, res) => {
-  const { nombre, tipo, descripcion, precio, imagen, categoria, estado } = req.body;
+app.put("/admin/productos/:id", verifyToken, (req, res) => {
+  const { nombre, tipo, descripcion, precio, imagen, categoria, estado, stock } = req.body;
+  const stockNum = stock !== undefined && stock !== null ? Number(stock) : null;
+
+  let finalEstado = estado;
+  if (stockNum !== null) {
+    if (stockNum === 0 && (finalEstado === "Activo" || finalEstado === "Disponible")) {
+      finalEstado = "Agotado";
+    } else if (stockNum > 0 && finalEstado === "Agotado") {
+      finalEstado = "Activo";
+    }
+  }
+
   const query = "UPDATE Productos SET Nombre_Producto=?, Tipo=?, Descripcion=?, Precio=?, Imagen=?, Estado=?, Categoria_producto_idCategoria=? WHERE idProductos=?";
-  db.query(query, [nombre, tipo, descripcion, precio, imagen, estado, categoria, req.params.id], (err) => {
+  db.query(query, [nombre, tipo, descripcion, precio, imagen, finalEstado, categoria, req.params.id], (err) => {
     if (err) return res.status(500).json({ error: err.sqlMessage });
-    res.json({ message: "Producto actualizado" });
+
+    if (stockNum !== null) {
+      db.query("SELECT Cantidad_Actual FROM Stock WHERE Productos_idProductos = ?", [req.params.id], (errStock, resultStock) => {
+        if (errStock) {
+          console.error("Error al consultar stock actual:", errStock.sqlMessage);
+        } else if (resultStock.length === 0) {
+          db.query("INSERT INTO Stock (Productos_idProductos, Cantidad_Actual) VALUES (?, ?)", [req.params.id, stockNum], () => {
+            if (stockNum > 0) {
+              db.query("INSERT INTO Movimientos_Inventario (Productos_idProductos, Tipo_Movimiento, Cantidad, Observacion) VALUES (?, 'Entrada', ?, ?)", [req.params.id, stockNum, "Inventario inicial"]);
+            }
+          });
+        } else {
+          const stockActual = resultStock[0].Cantidad_Actual;
+          if (stockActual !== stockNum) {
+            const diff = stockNum - stockActual;
+            const tipoMovimiento = diff > 0 ? "Entrada" : "Salida";
+            const cantMovimiento = Math.abs(diff);
+
+            db.query("UPDATE Stock SET Cantidad_Actual = ? WHERE Productos_idProductos = ?", [stockNum, req.params.id], (errUpdate) => {
+              if (!errUpdate) {
+                db.query(
+                  "INSERT INTO Movimientos_Inventario (Productos_idProductos, Tipo_Movimiento, Cantidad, Observacion) VALUES (?, ?, ?, ?)",
+                  [req.params.id, tipoMovimiento, cantMovimiento, "Ajuste por edición de producto"]
+                );
+              }
+            });
+          }
+        }
+      });
+    }
+
+    res.json({ message: "Producto actualizado con éxito" });
+    registrarAuditoriaProducto(req.params.id, req.usuario?.id, "Edición", "Datos generales del producto actualizados");
   });
 });
 
-app.delete("/admin/productos/:id", (req, res) => {
-  db.query("DELETE FROM Productos WHERE idProductos = ?", [req.params.id], (err) => {
+app.delete("/admin/productos/:id", verifyToken, (req, res) => {
+  db.query("INSERT INTO Productos_Papelera (Productos_idProductos, Eliminado_Por) VALUES (?, ?) ON DUPLICATE KEY UPDATE Eliminado_En = CURRENT_TIMESTAMP, Eliminado_Por = VALUES(Eliminado_Por)", [req.params.id, req.usuario?.id || null], (err) => {
     if (err) return res.status(500).json({ error: err.sqlMessage });
-    res.json({ message: "Producto eliminado" });
+    registrarAuditoriaProducto(req.params.id, req.usuario?.id, "Enviado a papelera", "Producto ocultado del catálogo y CRUD");
+    res.json({ message: "Producto enviado a la papelera" });
+  });
+});
+
+app.get("/admin/productos/papelera", verifyToken, (req, res) => {
+  db.query(`SELECT p.idProductos, p.Nombre_Producto, p.Precio, papelera.Eliminado_En FROM Productos_Papelera papelera JOIN Productos p ON p.idProductos = papelera.Productos_idProductos ORDER BY papelera.Eliminado_En DESC`, (err, result) => {
+    if (err) return res.status(500).json({ error: err.sqlMessage });
+    res.json(result);
+  });
+});
+
+app.put("/admin/productos/:id/restaurar", verifyToken, (req, res) => {
+  db.query("DELETE FROM Productos_Papelera WHERE Productos_idProductos = ?", [req.params.id], (err) => {
+    if (err) return res.status(500).json({ error: err.sqlMessage });
+    registrarAuditoriaProducto(req.params.id, req.usuario?.id, "Restauración", "Producto restaurado desde la papelera");
+    res.json({ message: "Producto restaurado" });
+  });
+});
+
+app.get("/productos/:id/catalogo", (req, res) => {
+  const idProducto = req.params.id;
+  const consultas = [
+    "SELECT COALESCE(Marca, '') AS Marca, COALESCE(Material, '') AS Material, COALESCE(Nivel_Proteccion, '') AS Nivel_Proteccion, Stock_Minimo FROM Producto_Atributos WHERE Productos_idProductos = ?",
+    "SELECT idProductoImagen, Url_Imagen, Orden FROM Producto_Imagenes WHERE Productos_idProductos = ? ORDER BY Orden, idProductoImagen",
+    "SELECT idProductoVariante, Color, Talla, Imagen, Stock FROM Producto_Variantes WHERE Productos_idProductos = ? AND Activa = 1 ORDER BY Color, Talla",
+    "SELECT r.idResena, r.Calificacion, r.Comentario, r.Verificada, r.Fecha, CONCAT(COALESCE(u.Nombres, 'Cliente'), ' ', COALESCE(u.Apellidos, '')) AS Cliente FROM Resenas_Productos r LEFT JOIN Usuarios u ON u.idUsuarios = r.Usuarios_idUsuarios WHERE r.Productos_idProductos = ? ORDER BY r.Fecha DESC",
+  ];
+  Promise.all(consultas.map((query) => new Promise((resolve, reject) => db.query(query, [idProducto], (error, resultado) => error ? reject(error) : resolve(resultado)))))
+    .then(([atributos, imagenes, variantes, resenas]) => res.json({ atributos: atributos[0] || {}, imagenes, variantes, resenas }))
+    .catch((error) => res.status(500).json({ error: error.sqlMessage }));
+});
+
+app.put("/admin/productos/:id/catalogo", verifyToken, (req, res) => {
+  const { atributos = {}, imagenes = [], variantes = [] } = req.body;
+  const idProducto = req.params.id;
+  const imagenesLimpias = imagenes.filter((imagen) => imagen?.url).map((imagen, indice) => [idProducto, imagen.url.trim(), Number(imagen.orden ?? indice)]);
+  const variantesLimpias = variantes.filter((variante) => variante?.talla && variante?.color).map((variante) => [idProducto, variante.color.trim(), variante.talla.trim(), variante.imagen?.trim() || null, Math.max(0, Number(variante.stock || 0))]);
+  db.beginTransaction((inicioError) => {
+    if (inicioError) return res.status(500).json({ error: inicioError.sqlMessage });
+    const revertir = (error) => db.rollback(() => res.status(500).json({ error: error.sqlMessage || "No se pudo guardar la configuración de catálogo" }));
+    db.query("INSERT INTO Producto_Atributos (Productos_idProductos, Marca, Material, Nivel_Proteccion, Stock_Minimo) VALUES (?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE Marca = VALUES(Marca), Material = VALUES(Material), Nivel_Proteccion = VALUES(Nivel_Proteccion), Stock_Minimo = VALUES(Stock_Minimo)", [idProducto, atributos.marca || null, atributos.material || null, atributos.nivelProteccion || null, Math.max(0, Number(atributos.stockMinimo ?? 5))], (error) => {
+      if (error) return revertir(error);
+      db.query("DELETE FROM Producto_Imagenes WHERE Productos_idProductos = ?", [idProducto], (errorImagenes) => {
+        if (errorImagenes) return revertir(errorImagenes);
+        const guardarImagenes = () => db.query("DELETE FROM Producto_Variantes WHERE Productos_idProductos = ?", [idProducto], (errorVariantes) => {
+          if (errorVariantes) return revertir(errorVariantes);
+          const guardarVariantes = () => {
+            if (!variantesLimpias.length) return finalizar();
+            db.query("INSERT INTO Producto_Variantes (Productos_idProductos, Color, Talla, Imagen, Stock) VALUES ?", [variantesLimpias], (errorInsertar) => errorInsertar ? revertir(errorInsertar) : finalizar());
+          };
+          guardarVariantes();
+        });
+        if (!imagenesLimpias.length) return guardarImagenes();
+        db.query("INSERT INTO Producto_Imagenes (Productos_idProductos, Url_Imagen, Orden) VALUES ?", [imagenesLimpias], (errorInsertar) => errorInsertar ? revertir(errorInsertar) : guardarImagenes());
+      });
+    });
+    const finalizar = () => db.commit((commitError) => {
+      if (commitError) return revertir(commitError);
+      registrarAuditoriaProducto(idProducto, req.usuario?.id, "Configuración de catálogo", "Atributos, imágenes, variantes y stock mínimo actualizados");
+      res.json({ message: "Configuración de catálogo guardada" });
+    });
+  });
+});
+
+app.get("/admin/productos/:id/auditoria", verifyToken, (req, res) => {
+  db.query(`SELECT a.idAuditoriaProducto, a.Accion, a.Detalle, a.Creada_En, CONCAT(COALESCE(u.Nombres, 'Sistema'), ' ', COALESCE(u.Apellidos, '')) AS Usuario FROM Auditoria_Productos a LEFT JOIN Usuarios u ON u.idUsuarios = a.Usuarios_idUsuarios WHERE a.Productos_idProductos = ? ORDER BY a.Creada_En DESC`, [req.params.id], (error, resultado) => {
+    if (error) return res.status(500).json({ error: error.sqlMessage });
+    res.json(resultado);
+  });
+});
+
+app.get("/admin/inventario/alertas", verifyToken, (req, res) => {
+  const query = `SELECT p.idProductos, p.Nombre_Producto, COALESCE(a.Stock_Minimo, 5) AS Stock_Minimo,
+    CASE WHEN COUNT(v.idProductoVariante) > 0 THEN SUM(v.Stock) ELSE COALESCE(s.Cantidad_Actual, 0) END AS Stock
+    FROM Productos p LEFT JOIN Stock s ON s.Productos_idProductos = p.idProductos
+    LEFT JOIN Producto_Atributos a ON a.Productos_idProductos = p.idProductos
+    LEFT JOIN Producto_Variantes v ON v.Productos_idProductos = p.idProductos AND v.Activa = 1
+    LEFT JOIN Productos_Papelera papelera ON papelera.Productos_idProductos = p.idProductos
+    WHERE papelera.Productos_idProductos IS NULL GROUP BY p.idProductos, a.Stock_Minimo, s.Cantidad_Actual
+    HAVING Stock <= Stock_Minimo ORDER BY Stock ASC`;
+  db.query(query, (error, resultado) => {
+    if (error) return res.status(500).json({ error: error.sqlMessage });
+    res.json(resultado);
+  });
+});
+
+app.put("/admin/inventario/ajuste-masivo", verifyToken, (req, res) => {
+  const { categoria, tipo, valor } = req.body;
+  const numero = Number(valor);
+  if (!categoria || !["precio_porcentaje", "stock_delta"].includes(tipo) || !Number.isFinite(numero)) return res.status(400).json({ error: "Datos de ajuste inválidos" });
+  const consultaProductos = "SELECT p.idProductos FROM Productos p JOIN Categoria_productos c ON c.idCategorias = p.Categoria_producto_idCategoria LEFT JOIN Productos_Papelera papelera ON papelera.Productos_idProductos = p.idProductos WHERE c.nombre = ? AND papelera.Productos_idProductos IS NULL";
+  db.query(consultaProductos, [categoria], (error, productos) => {
+    if (error) return res.status(500).json({ error: error.sqlMessage });
+    if (!productos.length) return res.status(404).json({ error: "No hay productos activos en esa categoría" });
+    const ids = productos.map((producto) => producto.idProductos);
+    const query = tipo === "precio_porcentaje" ? "UPDATE Productos SET Precio = GREATEST(0, Precio * (1 + ? / 100)) WHERE idProductos IN (?)" : "UPDATE Stock SET Cantidad_Actual = GREATEST(0, Cantidad_Actual + ?) WHERE Productos_idProductos IN (?)";
+    db.query(query, [numero, ids], (actualizarError) => {
+      if (actualizarError) return res.status(500).json({ error: actualizarError.sqlMessage });
+      ids.forEach((id) => registrarAuditoriaProducto(id, req.usuario?.id, "Ajuste masivo", `${tipo}: ${numero} para categoría ${categoria}`));
+      res.json({ message: "Ajuste masivo aplicado", productosActualizados: ids.length });
+    });
+  });
+});
+
+app.post("/productos/:id/resenas", verifyToken, (req, res) => {
+  const { calificacion, comentario } = req.body;
+  const puntuacion = Number(calificacion);
+  if (!Number.isInteger(puntuacion) || puntuacion < 1 || puntuacion > 5) return res.status(400).json({ error: "La calificación debe estar entre 1 y 5" });
+  const verificarCompra = "SELECT 1 FROM Detalle_Facturas d JOIN Facturas f ON f.idFacturas = d.Factura_idFactura WHERE d.Productos_idProductos = ? AND f.Usuarios_idUsuarios = ? LIMIT 1";
+  db.query(verificarCompra, [req.params.id, req.usuario.id], (error, compras) => {
+    if (error) return res.status(500).json({ error: error.sqlMessage });
+    db.query("INSERT INTO Resenas_Productos (Productos_idProductos, Usuarios_idUsuarios, Calificacion, Comentario, Verificada) VALUES (?, ?, ?, ?, ?)", [req.params.id, req.usuario.id, puntuacion, comentario?.trim() || null, compras.length ? 1 : 0], (insertarError) => {
+      if (insertarError) return res.status(500).json({ error: insertarError.sqlMessage });
+      res.status(201).json({ message: "Reseña publicada", verificada: Boolean(compras.length) });
+    });
+  });
+});
+
+app.post("/productos/:id/alerta-reposicion", (req, res) => {
+  const correo = req.body.correo?.trim();
+  if (!correo) return res.status(400).json({ error: "El correo es obligatorio" });
+  db.query("INSERT INTO Alertas_Reposicion (Productos_idProductos, Correo) VALUES (?, ?) ON DUPLICATE KEY UPDATE Creada_En = CURRENT_TIMESTAMP, Notificada_En = NULL", [req.params.id, correo], (error) => {
+    if (error) return res.status(500).json({ error: error.sqlMessage });
+    res.status(201).json({ message: "Te avisaremos cuando este producto tenga inventario" });
+  });
+});
+
+app.get("/productos/:id/relacionados", (req, res) => {
+  const query = `SELECT p.idProductos, p.Nombre_Producto, p.Precio, p.Imagen, c.nombre AS Categoria FROM Productos actual
+    JOIN Productos p ON p.Categoria_producto_idCategoria = actual.Categoria_producto_idCategoria AND p.idProductos <> actual.idProductos
+    JOIN Categoria_productos c ON c.idCategorias = p.Categoria_producto_idCategoria LEFT JOIN Productos_Papelera papelera ON papelera.Productos_idProductos = p.idProductos
+    WHERE actual.idProductos = ? AND papelera.Productos_idProductos IS NULL ORDER BY p.Nombre_Producto LIMIT 4`;
+  db.query(query, [req.params.id], (error, resultado) => error ? res.status(500).json({ error: error.sqlMessage }) : res.json(resultado));
+});
+
+app.get("/productos/:id/comprados-juntos", (req, res) => {
+  const query = `SELECT p.idProductos, p.Nombre_Producto, p.Precio, p.Imagen, COUNT(*) AS Veces FROM Detalle_Facturas base
+    JOIN Detalle_Facturas otro ON otro.Factura_idFactura = base.Factura_idFactura AND otro.Productos_idProductos <> base.Productos_idProductos
+    JOIN Productos p ON p.idProductos = otro.Productos_idProductos LEFT JOIN Productos_Papelera papelera ON papelera.Productos_idProductos = p.idProductos
+    WHERE base.Productos_idProductos = ? AND papelera.Productos_idProductos IS NULL GROUP BY p.idProductos ORDER BY Veces DESC LIMIT 4`;
+  db.query(query, [req.params.id], (error, resultado) => error ? res.status(500).json({ error: error.sqlMessage }) : res.json(resultado));
+});
+
+app.post("/cupones/validar", (req, res) => {
+  const { codigo, subtotal } = req.body;
+  db.query("SELECT * FROM Cupones WHERE Codigo = ? AND Activo = 1 AND (Fecha_Inicio IS NULL OR Fecha_Inicio <= CURDATE()) AND (Fecha_Fin IS NULL OR Fecha_Fin >= CURDATE())", [codigo?.trim().toUpperCase()], (error, cupones) => {
+    if (error) return res.status(500).json({ error: error.sqlMessage });
+    const cupon = cupones[0];
+    if (!cupon || Number(subtotal) < Number(cupon.Minimo_Compra)) return res.status(404).json({ error: "Cupón no válido o no aplicable" });
+    const descuento = cupon.Tipo === "porcentaje" ? Number(subtotal) * Number(cupon.Valor) / 100 : Number(cupon.Valor);
+    res.json({ codigo: cupon.Codigo, descuento: Math.min(Number(subtotal), descuento) });
   });
 });
 
@@ -325,36 +631,91 @@ app.get("/categorias", (req, res) => {
 });
 
 
-app.post("/pedidos", (req, res) => {
-  const { idUsuario, total, productos } = req.body;
+const procesarCompra = async (req, res) => {
+  const { idUsuario, total, productos, estado } = req.body;
+  const estadoRecibo = estado || "Pagado";
 
-  const queryFactura = "INSERT INTO Facturas (Total, Usuarios_idUsuarios) VALUES (?, ?)";
-  db.query(queryFactura, [total, idUsuario], (err, result) => {
+  // 1. Crear la Factura
+  const queryFactura = "INSERT INTO Facturas (Fecha, Estado, Total, Usuarios_idUsuarios) VALUES (NOW(), ?, ?, ?)";
+  db.query(queryFactura, [estadoRecibo, total, idUsuario], async (err, result) => {
     if (err) return res.status(500).json({ error: err.sqlMessage });
 
     const idFactura = result.insertId;
     const detalles = productos.map((p) => [idFactura, p.idProducto, p.cantidad, p.precioUnitario]);
 
+    // 2. Crear los Detalle_Facturas
     const queryDetalles = "INSERT INTO Detalle_Facturas (Factura_idFactura, Productos_idProductos, Cantidad, Precio_Unitario) VALUES ?";
-    db.query(queryDetalles, [detalles], (err2) => {
+    db.query(queryDetalles, [detalles], async (err2) => {
       if (err2) return res.status(500).json({ error: err2.sqlMessage });
 
-      
+      // 3. Crear el registro en Entregas para vincular con el seguimiento
+      const queryEntrega = `
+        INSERT INTO Entregas (Factura_idFactura, Usuarios_idUsuarios, Fecha_entrega, Estado_Entrega, Observaciones) 
+        VALUES (?, ?, CURDATE(), 'En Proceso', 'Pedido registrado por el usuario')
+      `;
+      db.query(queryEntrega, [idFactura, idUsuario], (errEntrega) => {
+        if (errEntrega) console.error("Error al crear Entrega:", errEntrega.sqlMessage);
+      });
+
+      // 4. Actualizar Stock, Estados y Movimientos
       productos.forEach((p) => {
         db.query(
           "UPDATE Stock SET Cantidad_Actual = GREATEST(Cantidad_Actual - ?, 0) WHERE Productos_idProductos = ?",
-          [p.cantidad, p.idProducto]
+          [p.cantidad, p.idProducto],
+          () => {
+            db.query(
+              "SELECT Cantidad_Actual FROM Stock WHERE Productos_idProductos = ?",
+              [p.idProducto],
+              (errStock, stockRes) => {
+                if (!errStock && stockRes.length > 0 && stockRes[0].Cantidad_Actual === 0) {
+                  db.query("UPDATE Productos SET Estado = 'Agotado' WHERE idProductos = ?", [p.idProducto]);
+                }
+              }
+            );
+          }
         );
+
         db.query(
           "INSERT INTO Movimientos_Inventario (Productos_idProductos, Tipo_Movimiento, Cantidad, Observacion) VALUES (?, 'Salida', ?, ?)",
           [p.idProducto, p.cantidad, `Venta factura #${idFactura}`]
         );
       });
 
-      res.status(201).json({ message: "Pedido creado", idFactura });
+      // 5. Sincronizar con Supabase si está activo
+      if (supabase) {
+        try {
+          const { data: sbFactura, error: sbErr } = await supabase.from("Facturas").insert([{
+            Fecha: new Date().toISOString(),
+            Estado: estadoRecibo,
+            Total: Number(total),
+            Usuarios_idUsuarios: Number(idUsuario)
+          }]).select();
+
+          if (!sbErr && sbFactura && sbFactura[0]) {
+            const sbItems = productos.map((p) => ({
+              Factura_idFactura: sbFactura[0].idFacturas,
+              Productos_idProductos: p.idProducto,
+              Cantidad: p.cantidad,
+              Precio_Unitario: p.precioUnitario
+            }));
+            await supabase.from("Detalle_Facturas").insert(sbItems);
+          }
+        } catch (sbE) {
+          console.warn("⚠️ Nota Supabase sync:", sbE.message);
+        }
+      }
+
+      res.status(201).json({ 
+        message: "Pedido y Recibo creados", 
+        idFactura,
+        numeroRecibo: `RC-${String(idFactura).padStart(4, "0")}`
+      });
     });
   });
-});
+};
+
+app.post("/pedidos", procesarCompra);
+app.post("/recibos", procesarCompra);
 
 
 app.get("/facturas", (req, res) => {
@@ -404,6 +765,74 @@ app.put("/facturas/:id/estado", (req, res) => {
     res.json({
       message: "Estado actualizado correctamente"
     });
+  });
+});
+
+// ===============================
+// RECIBOS DE COMPRA (PERFIL CONTADOR Y CLIENTE)
+// Estructura oficial tabla: Facturas (idFacturas, Fecha, Estado, Total, Usuarios_idUsuarios)
+// ===============================
+app.get("/recibos", (req, res) => {
+  const query = `
+    SELECT f.idFacturas, f.Fecha, f.Estado, f.Total, f.Usuarios_idUsuarios,
+           u.Nombres, u.Apellidos, u.Correo,
+           COALESCE(u.Telefono, '') AS Telefono,
+           COALESCE(u.Cedula, '') AS Cedula,
+           CONCAT(u.Nombres, ' ', u.Apellidos) AS clienteNombre,
+           CONCAT('RC-', LPAD(f.idFacturas, 4, '0')) AS Numero_Recibo
+    FROM Facturas f
+    JOIN Usuarios u ON f.Usuarios_idUsuarios = u.idUsuarios
+    ORDER BY f.Fecha DESC
+  `;
+  db.query(query, (err, result) => {
+    if (err) return res.status(500).json({ error: err.sqlMessage });
+    res.json(result);
+  });
+});
+
+app.get("/recibos/:id", (req, res) => {
+  const queryFactura = `
+    SELECT f.idFacturas, f.Fecha, f.Estado, f.Total, f.Usuarios_idUsuarios,
+           u.Nombres, u.Apellidos, u.Correo,
+           COALESCE(u.Telefono, '') AS Telefono,
+           COALESCE(u.Cedula, '') AS Cedula,
+           CONCAT(u.Nombres, ' ', u.Apellidos) AS clienteNombre,
+           CONCAT('RC-', LPAD(f.idFacturas, 4, '0')) AS Numero_Recibo
+    FROM Facturas f
+    JOIN Usuarios u ON f.Usuarios_idUsuarios = u.idUsuarios
+    WHERE f.idFacturas = ?
+  `;
+
+  db.query(queryFactura, [req.params.id], (err, facturas) => {
+    if (err) return res.status(500).json({ error: err.sqlMessage });
+    if (facturas.length === 0) return res.status(404).json({ error: "Recibo no encontrado" });
+
+    const queryDetalles = `
+      SELECT d.idDetalles, d.Factura_idFactura, d.Productos_idProductos, d.Cantidad, d.Precio_Unitario,
+             p.Nombre_Producto, p.Imagen,
+             (d.Cantidad * d.Precio_Unitario) AS Subtotal
+      FROM Detalle_Facturas d
+      JOIN Productos p ON d.Productos_idProductos = p.idProductos
+      WHERE d.Factura_idFactura = ?
+    `;
+
+    db.query(queryDetalles, [req.params.id], (errDetalles, detalles) => {
+      if (errDetalles) return res.status(500).json({ error: errDetalles.sqlMessage });
+
+      res.json({
+        recibo: facturas[0],
+        detalles: detalles
+      });
+    });
+  });
+});
+
+app.put("/recibos/:id/estado", (req, res) => {
+  const { estado } = req.body;
+  const query = "UPDATE Facturas SET Estado = ? WHERE idFacturas = ?";
+  db.query(query, [estado, req.params.id], (err) => {
+    if (err) return res.status(500).json({ error: err.sqlMessage });
+    res.json({ message: "Estado del recibo actualizado correctamente" });
   });
 });
 
@@ -570,6 +999,29 @@ app.put("/devoluciones/:id/estado", (req, res) => {
     res.json({
       message: "Estado actualizado correctamente"
     });
+  });
+});
+
+
+app.get("/stock", (req, res) => {
+  const query = `
+    SELECT 
+      s.Productos_idProductos AS idProducto,
+      p.Nombre_Producto,
+      p.Tipo,
+      p.Precio,
+      p.Estado,
+      s.Cantidad_Actual,
+      s.Ultima_Actualizacion,
+      c.nombre AS Categoria
+    FROM Stock s
+    JOIN Productos p ON s.Productos_idProductos = p.idProductos
+    JOIN Categoria_productos c ON p.Categoria_producto_idCategoria = c.idCategorias
+    ORDER BY p.Nombre_Producto
+  `;
+  db.query(query, (err, result) => {
+    if (err) return res.status(500).json({ error: err.sqlMessage });
+    res.json(result);
   });
 });
 
@@ -845,41 +1297,24 @@ app.get("/bancos-pse", (req, res) => {
 // ============================================================
 
 app.get("/mis-pedidos/:idUsuario", (req, res) => {
+  const { idUsuario } = req.params;
+
   const query = `
     SELECT 
-      f.idFacturas,
-      f.Fecha,
-      f.Estado,
+      f.idFacturas, 
+      f.Fecha, 
+      f.Estado, 
       f.Total,
-      e.Estado_Entrega,
-      GROUP_CONCAT(
-        CONCAT(
-          p.Nombre_Producto,
-          ' x',
-          d.Cantidad
-        )
-        SEPARATOR ', '
-      ) AS Productos
+      COALESCE(e.Estado_Entrega, 'En Proceso') AS Estado_Entrega
     FROM Facturas f
-    LEFT JOIN Entregas e
-      ON e.Factura_idFactura = f.idFacturas
-    LEFT JOIN Detalle_Facturas d
-      ON f.idFacturas = d.Factura_idFactura
-    LEFT JOIN Productos p
-      ON d.Productos_idProductos = p.idProductos
+    LEFT JOIN Entregas e ON e.Factura_idFactura = f.idFacturas
     WHERE f.Usuarios_idUsuarios = ?
-    GROUP BY f.idFacturas
     ORDER BY f.Fecha DESC
   `;
 
-  db.query(query, [req.params.idUsuario], (err, result) => {
-    if (err) {
-      return res.status(500).json({
-        error: err.sqlMessage,
-      });
-    }
-
-    res.json(result);
+  db.query(query, [idUsuario], (err, results) => {
+    if (err) return res.status(500).json({ error: err.sqlMessage });
+    res.json(results);
   });
 });
 
